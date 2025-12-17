@@ -47,11 +47,26 @@
 
 ### 方式一：Docker 部署（推荐）
 
+#### 使用 GitHub Container Registry 镜像（推荐）
+
+```bash
+# 直接使用自动构建的 Docker 镜像
+docker run -d \
+  --name sora2api \
+  -p 8000:8000 \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/config/setting.toml:/app/config/setting.toml \
+  ghcr.io/raomaiping/sora2api:latest
+
+# 查看日志
+docker logs -f sora2api
+```
+
 #### 标准模式（不使用代理）
 
 ```bash
 # 克隆项目
-git clone https://github.com/TheSmallHanCat/sora2api.git
+git clone https://github.com/raomaiping/sora2api.git
 cd sora2api
 
 # 启动服务
@@ -70,6 +85,14 @@ docker-compose -f docker-compose.warp.yml up -d
 # 查看日志
 docker-compose -f docker-compose.warp.yml logs -f
 ```
+
+#### Docker 镜像自动构建
+
+项目已配置 GitHub Actions，每次推送到 `main` 分支或创建版本标签时，会自动构建并推送 Docker 镜像到 GitHub Container Registry：
+
+- **镜像地址**: `ghcr.io/raomaiping/sora2api:latest`
+- **查看构建状态**: 访问 [GitHub Actions](https://github.com/raomaiping/sora2api/actions)
+- **查看镜像**: 访问 [GitHub Packages](https://github.com/raomaiping/sora2api/pkgs/container/sora2api)
 
 ### 方式二：本地部署
 
