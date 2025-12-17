@@ -1,4 +1,11 @@
 """Main application entry point"""
+import sys
+import io
+# Set UTF-8 encoding for Windows console
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse
@@ -101,13 +108,13 @@ async def startup_event():
 
     # Handle database initialization based on startup type
     if is_first_startup:
-        print("🎉 First startup detected. Initializing database and configuration from setting.toml...")
+        print("[*] First startup detected. Initializing database and configuration from setting.toml...")
         await db.init_config_from_toml(config_dict, is_first_startup=True)
-        print("✓ Database and configuration initialized successfully.")
+        print("[+] Database and configuration initialized successfully.")
     else:
-        print("🔄 Existing database detected. Checking for missing tables and columns...")
+        print("[*] Existing database detected. Checking for missing tables and columns...")
         await db.check_and_migrate_db(config_dict)
-        print("✓ Database migration check completed.")
+        print("[+] Database migration check completed.")
 
     # Load admin credentials and API key from database
     admin_config = await db.get_admin_config()
@@ -133,7 +140,7 @@ async def startup_event():
     # Initialize concurrency manager with all tokens
     all_tokens = await db.get_all_tokens()
     await concurrency_manager.initialize(all_tokens)
-    print(f"✓ Concurrency manager initialized with {len(all_tokens)} tokens")
+    print(f"[+] Concurrency manager initialized with {len(all_tokens)} tokens")
 
     # Start file cache cleanup task
     await generation_handler.file_cache.start_cleanup_task()

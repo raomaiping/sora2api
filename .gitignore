@@ -45,7 +45,16 @@ Thumbs.db
 
 # Logs
 *.log
+logs.txt
 
 # Environment
 .env
 .env.local
+
+# Test
+.pytest_cache/
+*.pyc
+__pycache__/
+
+# Temporary files
+tmp/

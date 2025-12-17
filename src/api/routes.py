@@ -77,6 +77,10 @@ async def create_chat_completion(
         if not request.messages:
             raise HTTPException(status_code=400, detail="Messages cannot be empty")
 
+        # Validate model before processing messages
+        if request.model not in MODEL_CONFIG:
+            raise HTTPException(status_code=400, detail=f"Invalid model: {request.model}")
+
         last_message = request.messages[-1]
         content = last_message.content
 
@@ -126,10 +130,6 @@ async def create_chat_completion(
                             video_data = url
         else:
             raise HTTPException(status_code=400, detail="Invalid content format")
-
-        # Validate model
-        if request.model not in MODEL_CONFIG:
-            raise HTTPException(status_code=400, detail=f"Invalid model: {request.model}")
 
         # Check if this is a video model
         model_config = MODEL_CONFIG[request.model]
@@ -233,6 +233,9 @@ async def create_chat_completion(
                     }
                 )
 
+    except HTTPException:
+        # Re-raise HTTPException to preserve status code
+        raise
     except Exception as e:
         # Return OpenAI-compatible error format
         return JSONResponse(
