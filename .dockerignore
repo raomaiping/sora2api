@@ -1,0 +1,58 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs.txt
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+
+# Test
+.pytest_cache/
+tests/
+requirements-test.txt
+run_tests.py
+
+# Temporary files
+tmp/
+
+# Environment
+.env
+.env.local
+
+# GitHub
+.github/
+
+# Documentation
+README.md
+LICENSE
+
