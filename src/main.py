@@ -107,15 +107,16 @@ async def startup_event():
     # Initialize database tables
     await db.init_db()
 
+    # Always run migration check to ensure schema is up to date
+    print("[*] Checking database schema and performing migrations if needed...")
+    await db.check_and_migrate_db(config_dict)
+    print("[+] Database migration check completed.")
+
     # Handle database initialization based on startup type
     if is_first_startup:
-        print("[*] First startup detected. Initializing database and configuration from setting.toml...")
+        print("[*] First startup detected. Initializing configuration from setting.toml...")
         await db.init_config_from_toml(config_dict, is_first_startup=True)
-        print("[+] Database and configuration initialized successfully.")
-    else:
-        print("[*] Existing database detected. Checking for missing tables and columns...")
-        await db.check_and_migrate_db(config_dict)
-        print("[+] Database migration check completed.")
+        print("[+] Configuration initialized successfully.")
 
     # Load admin credentials and API key from database
     admin_config = await db.get_admin_config()

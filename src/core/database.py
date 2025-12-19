@@ -333,6 +333,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id TEXT UNIQUE NOT NULL,
+                    sora_task_id TEXT,
                     token_id INTEGER NOT NULL,
                     model TEXT NOT NULL,
                     prompt TEXT NOT NULL,
@@ -433,6 +434,7 @@ class Database:
             # Create indexes
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_task_sora_id ON tasks(sora_task_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_token_active ON tokens(is_active)")
 
             # Migration: Add daily statistics columns if they don't exist
