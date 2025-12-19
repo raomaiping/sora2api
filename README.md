@@ -53,7 +53,7 @@
 # 直接使用自动构建的 Docker 镜像
 docker run -d \
   --name sora2api \
-  -p 8000:8000 \
+  -p 8090:8090 \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/config/setting.toml:/app/config/setting.toml \
   ghcr.io/raomaiping/sora2api:latest
@@ -98,7 +98,7 @@ docker-compose -f docker-compose.warp.yml logs -f
 
 ```bash
 # 克隆项目
-git clone https://github.com/TheSmallHanCat/sora2api.git
+git clone https://github.com/raomaiping/sora2api.git
 cd sora2api
 
 # 创建虚拟环境
@@ -121,7 +121,7 @@ python main.py
 
 服务启动后，访问管理后台进行初始化配置：
 
-- **地址**: http://localhost:8000
+- **地址**: http://localhost:8090
 - **用户名**: `admin`
 - **密码**: `admin`
 
@@ -141,6 +141,8 @@ python main.py
 | 角色生成视频 | `sora-video*` | 使用 `content` 数组 + `video_url` + 文本 |
 | Remix | `sora-video*` | 在 `content` 中包含 Remix ID |
 | 视频分镜 | `sora-video*` | 在 `content` 中使用```[时长s]提示词```格式触发 |
+| 异步任务创建 | 所有模型 | 使用 `/v1/tasks` 端点创建任务，返回任务ID |
+| 查询任务状态 | - | 使用 `/v1/tasks/{task_id}` 端点查询任务状态 |
 
 ---
 
@@ -148,7 +150,7 @@ python main.py
 
 #### 基本信息（OpenAI标准格式，需要使用流式）
 
-- **端点**: `http://localhost:8000/v1/chat/completions`
+- **端点**: `http://localhost:8090/v1/chat/completions`
 - **认证**: 在请求头中添加 `Authorization: Bearer YOUR_API_KEY`
 - **默认 API Key**: `han1234`（建议修改）
 
@@ -178,7 +180,7 @@ python main.py
 **文生图**
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8090/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -195,7 +197,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 **图生图**
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8090/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -224,7 +226,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 **文生视频**
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8090/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -242,7 +244,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 **图生视频**
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8090/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -273,7 +275,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 * 提示词内包含remix分享链接或id即可
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8090/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -299,7 +301,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
   ```
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8090/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -329,7 +331,7 @@ Sora2API 支持**视频角色生成**功能。
 上传视频提取角色信息，获取角色名称和头像。
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8090/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -356,7 +358,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 上传视频创建角色，然后使用该角色生成新视频。
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8090/v1/chat/completions" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -394,7 +396,7 @@ with open("video.mp4", "rb") as f:
 
 # 仅创建角色
 response = requests.post(
-    "http://localhost:8000/v1/chat/completions",
+    "http://localhost:8090/v1/chat/completions",
     headers={
         "Authorization": "Bearer han1234",
         "Content-Type": "application/json"
@@ -427,6 +429,158 @@ for line in response.iter_lines():
 
 ---
 
+### 异步任务管理
+
+Sora2API 支持异步任务创建和查询，允许您提交任务后立即获得任务ID，然后通过轮询查询任务状态。
+
+#### 架构设计
+
+**工作流程：**
+
+1. **创建任务** (`POST /v1/tasks`)
+   - 调用内部方法 `create_task_async()` 创建任务
+   - 内部会调用 Sora API 创建生成任务，获取 Sora 的任务ID
+   - 生成内部任务ID（格式：`task_xxxxx`）并保存到数据库
+   - 立即返回内部任务ID给用户，不等待任务完成
+   - 后台自动启动轮询任务，使用创建任务时的 Token 查询 Sora API 状态
+
+2. **查询任务** (`GET /v1/tasks/{task_id}`)
+   - 直接从本地数据库查询任务状态
+   - 不调用 Sora API，响应速度快
+   - 返回任务状态、进度、结果URL等信息
+
+3. **后台轮询**（自动运行）
+   - 使用创建任务时的 Token 和 Sora 任务ID查询 Sora API
+   - 自动更新数据库中的任务状态、进度和结果URL
+   - 支持无水印模式：如果启用了无水印，会自动处理并保存无水印URL
+
+**优势：**
+- ✅ 查询快速：不依赖 Sora API 响应速度
+- ✅ 减少 API 调用：查询任务不调用 Sora API
+- ✅ 状态统一：由后台轮询统一更新数据库状态
+- ✅ 支持无水印：自动处理无水印视频URL
+
+#### 创建任务
+
+```bash
+curl -X POST "http://localhost:8090/v1/tasks" \
+  -H "Authorization: Bearer han1234" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sora-video-landscape-10s",
+    "prompt": "一只小猫在草地上奔跑",
+    "image": "data:image/png;base64,<base64_encoded_image_data>"
+  }'
+```
+
+**响应示例：**
+```json
+{
+  "task_id": "task_abc123xyz",
+  "status": "processing",
+  "message": "Task created successfully"
+}
+```
+
+#### 查询任务状态
+
+```bash
+curl -X GET "http://localhost:8090/v1/tasks/task_abc123xyz" \
+  -H "Authorization: Bearer han1234"
+```
+
+**响应示例（处理中）：**
+```json
+{
+  "task_id": "task_abc123xyz",
+  "status": "processing",
+  "progress": 45.0,
+  "model": "sora-video-landscape-10s",
+  "prompt": "一只小猫在草地上奔跑",
+  "result_urls": null,
+  "error_message": null,
+  "created_at": "2024-01-01T12:00:00",
+  "completed_at": null
+}
+```
+
+**响应示例（已完成）：**
+```json
+{
+  "task_id": "task_abc123xyz",
+  "status": "completed",
+  "progress": 100.0,
+  "model": "sora-video-landscape-10s",
+  "prompt": "一只小猫在草地上奔跑",
+  "result_urls": [
+    "http://localhost:8090/tmp/video_abc123.mp4"
+  ],
+  "error_message": null,
+  "created_at": "2024-01-01T12:00:00",
+  "completed_at": "2024-01-01T12:05:30"
+}
+```
+
+**响应示例（失败）：**
+```json
+{
+  "task_id": "task_abc123xyz",
+  "status": "failed",
+  "progress": 0.0,
+  "model": "sora-video-landscape-10s",
+  "prompt": "一只小猫在草地上奔跑",
+  "result_urls": null,
+  "error_message": "Content policy violation: Content violates guardrails",
+  "created_at": "2024-01-01T12:00:00",
+  "completed_at": "2024-01-01T12:01:00"
+}
+```
+
+#### Python 代码示例
+
+```python
+import requests
+import time
+
+# 创建任务
+response = requests.post(
+    "http://localhost:8090/v1/tasks",
+    headers={
+        "Authorization": "Bearer han1234",
+        "Content-Type": "application/json"
+    },
+    json={
+        "model": "sora-video-landscape-10s",
+        "prompt": "一只小猫在草地上奔跑"
+    }
+)
+
+task_data = response.json()
+task_id = task_data["task_id"]
+print(f"任务已创建，任务ID: {task_id}")
+
+# 轮询任务状态
+while True:
+    response = requests.get(
+        f"http://localhost:8090/v1/tasks/{task_id}",
+        headers={"Authorization": "Bearer han1234"}
+    )
+    
+    task_status = response.json()
+    print(f"任务状态: {task_status['status']}, 进度: {task_status['progress']}%")
+    
+    if task_status["status"] == "completed":
+        print(f"任务完成！结果URL: {task_status['result_urls']}")
+        break
+    elif task_status["status"] == "failed":
+        print(f"任务失败: {task_status['error_message']}")
+        break
+    
+    time.sleep(5)  # 每5秒查询一次
+```
+
+---
+
 ## 📄 许可证
 
 本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
@@ -441,8 +595,8 @@ for line in response.iter_lines():
 
 ## 📞 联系方式
 
-- 提交 Issue：[GitHub Issues](https://github.com/TheSmallHanCat/sora2api/issues)
-- 讨论：[GitHub Discussions](https://github.com/TheSmallHanCat/sora2api/discussions)
+- 提交 Issue：[GitHub Issues](https://github.com/raomaiping/sora2api/issues)
+- 讨论：[GitHub Discussions](https://github.com/raomaiping/sora2api/discussions)
 
 ---
 
@@ -450,4 +604,4 @@ for line in response.iter_lines():
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=TheSmallHanCat/sora2api&type=date&legend=top-left)](https://www.star-history.com/#TheSmallHanCat/sora2api&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=raomaiping/sora2api&type=date&legend=top-left)](https://www.star-history.com/#raomaiping/sora2api&type=date&legend=top-left)
