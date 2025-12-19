@@ -5,6 +5,7 @@ import base64
 import time
 import random
 import re
+import uuid
 from typing import Optional, AsyncGenerator, Dict, Any
 from datetime import datetime
 from .sora_client import SoraClient
@@ -206,6 +207,196 @@ class GenerationHandler:
         token_obj = await self.load_balancer.select_token(for_image_generation=is_image, for_video_generation=is_video)
         return token_obj is not None
 
+    async def create_task_async(self, model: str, prompt: str,
+                                image: Optional[str] = None,
+                                video: Optional[str] = None,
+                                remix_target_id: Optional[str] = None) -> dict:
+        """Create a generation task asynchronously and return task ID immediately
+        
+        This method creates the task and starts processing in the background,
+        but returns immediately with the task ID without waiting for completion.
+
+        Args:
+            model: Model name
+            prompt: Generation prompt
+            image: Base64 encoded image
+            video: Base64 encoded video or video URL
+            remix_target_id: Sora share link video ID for remix
+
+        Returns:
+            Dictionary with task_id and status
+        """
+        # Validate model
+        if model not in MODEL_CONFIG:
+            raise ValueError(f"Invalid model: {model}")
+
+        model_config = MODEL_CONFIG[model]
+        is_video = model_config["type"] == "video"
+        is_image = model_config["type"] == "image"
+
+        # Select token
+        token_obj = await self.load_balancer.select_token(for_image_generation=is_image, for_video_generation=is_video)
+        if not token_obj:
+            if is_image:
+                raise Exception("No available tokens for image generation. All tokens are either disabled, cooling down, locked, or expired.")
+            else:
+                raise Exception("No available tokens for video generation. All tokens are either disabled, cooling down, Sora2 quota exhausted, don't support Sora2, or expired.")
+
+        # Acquire lock for image generation
+        if is_image:
+            lock_acquired = await self.load_balancer.token_lock.acquire_lock(token_obj.id)
+            if not lock_acquired:
+                raise Exception(f"Failed to acquire lock for token {token_obj.id}")
+
+            # Acquire concurrency slot for image generation
+            if self.concurrency_manager:
+                concurrency_acquired = await self.concurrency_manager.acquire_image(token_obj.id)
+                if not concurrency_acquired:
+                    await self.load_balancer.token_lock.release_lock(token_obj.id)
+                    raise Exception(f"Failed to acquire concurrency slot for token {token_obj.id}")
+
+        # Acquire concurrency slot for video generation
+        if is_video and self.concurrency_manager:
+            concurrency_acquired = await self.concurrency_manager.acquire_video(token_obj.id)
+            if not concurrency_acquired:
+                raise Exception(f"Failed to acquire concurrency slot for token {token_obj.id}")
+
+        task_id = None
+        try:
+            # Upload image if provided
+            media_id = None
+            if image:
+                image_data = self._decode_base64_image(image)
+                media_id = await self.sora_client.upload_image(image_data, token_obj.token)
+
+            # Generate task
+            sora_task_id = None
+            if is_video:
+                n_frames = model_config.get("n_frames", 300)
+
+                # Check if prompt is in storyboard format
+                if self.sora_client.is_storyboard_prompt(prompt):
+                    formatted_prompt = self.sora_client.format_storyboard_prompt(prompt)
+                    sora_task_id = await self.sora_client.generate_storyboard(
+                        formatted_prompt, token_obj.token,
+                        orientation=model_config["orientation"],
+                        media_id=media_id,
+                        n_frames=n_frames
+                    )
+                elif remix_target_id:
+                    # Remix flow
+                    clean_prompt = self._clean_remix_link_from_prompt(prompt)
+                    sora_task_id = await self.sora_client.remix_video(
+                        remix_target_id=remix_target_id,
+                        prompt=clean_prompt,
+                        token=token_obj.token,
+                        orientation=model_config["orientation"],
+                        n_frames=n_frames
+                    )
+                else:
+                    # Normal video generation
+                    sora_task_id = await self.sora_client.generate_video(
+                        prompt, token_obj.token,
+                        orientation=model_config["orientation"],
+                        media_id=media_id,
+                        n_frames=n_frames
+                    )
+            else:
+                sora_task_id = await self.sora_client.generate_image(
+                    prompt, token_obj.token,
+                    width=model_config["width"],
+                    height=model_config["height"],
+                    media_id=media_id
+                )
+
+            # Generate internal task ID (UUID format)
+            internal_task_id = f"task_{uuid.uuid4().hex[:16]}"
+
+            # Save task to database
+            task = Task(
+                task_id=internal_task_id,  # Internal task ID
+                sora_task_id=sora_task_id,  # Sora's original task ID
+                token_id=token_obj.id,
+                model=model,
+                prompt=prompt,
+                status="processing",
+                progress=0.0
+            )
+            await self.db.create_task(task)
+
+            # Record usage
+            await self.token_manager.record_usage(token_obj.id, is_video=is_video)
+
+            # Start background polling task (fire and forget)
+            # Note: We don't await this, it runs in the background
+            import asyncio
+            asyncio.create_task(self._poll_task_background(
+                internal_task_id, sora_task_id, token_obj.token, is_video, prompt, token_obj.id, is_image
+            ))
+
+            return {
+                "task_id": internal_task_id,  # Return internal task ID to user
+                "status": "processing",
+                "message": "Task created successfully"
+            }
+
+        except Exception as e:
+            # Release resources on error
+            if is_image and token_obj:
+                await self.load_balancer.token_lock.release_lock(token_obj.id)
+                if self.concurrency_manager:
+                    await self.concurrency_manager.release_image(token_obj.id)
+            if is_video and token_obj and self.concurrency_manager:
+                await self.concurrency_manager.release_video(token_obj.id)
+            raise e
+
+    async def _poll_task_background(self, internal_task_id: str, sora_task_id: str, token: str, 
+                                    is_video: bool, prompt: str, token_id: int, is_image: bool):
+        """Background task polling (fire and forget)
+        
+        Args:
+            internal_task_id: Internal task ID (UUID format) for database updates
+            sora_task_id: Sora's original task ID for API polling
+            token: Access token
+            is_video: Whether this is a video task
+            prompt: Generation prompt
+            token_id: Token ID
+            is_image: Whether this is an image task
+        """
+        try:
+            # Poll for results using Sora's task ID, but update using internal task ID
+            async for _ in self._poll_task_result(sora_task_id, token, is_video, False, prompt, token_id, internal_task_id):
+                pass  # Just poll, don't yield anything
+            
+            # Record success after polling completes
+            await self.token_manager.record_success(token_id, is_video=is_video)
+            
+            # Release resources
+            if is_image:
+                await self.load_balancer.token_lock.release_lock(token_id)
+                if self.concurrency_manager:
+                    await self.concurrency_manager.release_image(token_id)
+            if is_video and self.concurrency_manager:
+                await self.concurrency_manager.release_video(token_id)
+                
+        except Exception as e:
+            # Record error
+            await self.token_manager.record_error(token_id)
+            
+            # Release resources on error
+            if is_image:
+                await self.load_balancer.token_lock.release_lock(token_id)
+                if self.concurrency_manager:
+                    await self.concurrency_manager.release_image(token_id)
+            if is_video and self.concurrency_manager:
+                await self.concurrency_manager.release_video(token_id)
+                
+            debug_logger.log_error(
+                error_message=f"Background polling failed for task {internal_task_id}: {str(e)}",
+                status_code=500,
+                response_text=str(e)
+            )
+
     async def handle_generation(self, model: str, prompt: str,
                                image: Optional[str] = None,
                                video: Optional[str] = None,
@@ -300,7 +491,7 @@ class GenerationHandler:
             if not concurrency_acquired:
                 raise Exception(f"Failed to acquire concurrency slot for token {token_obj.id}")
 
-        task_id = None
+        sora_task_id = None
         is_first_chunk = True  # Track if this is the first chunk
 
         try:
@@ -350,7 +541,7 @@ class GenerationHandler:
                     formatted_prompt = self.sora_client.format_storyboard_prompt(prompt)
                     debug_logger.log_info(f"Storyboard mode detected. Formatted prompt: {formatted_prompt}")
 
-                    task_id = await self.sora_client.generate_storyboard(
+                    sora_task_id = await self.sora_client.generate_storyboard(
                         formatted_prompt, token_obj.token,
                         orientation=model_config["orientation"],
                         media_id=media_id,
@@ -358,23 +549,27 @@ class GenerationHandler:
                     )
                 else:
                     # Normal video generation
-                    task_id = await self.sora_client.generate_video(
+                    sora_task_id = await self.sora_client.generate_video(
                         prompt, token_obj.token,
                         orientation=model_config["orientation"],
                         media_id=media_id,
                         n_frames=n_frames
                     )
             else:
-                task_id = await self.sora_client.generate_image(
+                sora_task_id = await self.sora_client.generate_image(
                     prompt, token_obj.token,
                     width=model_config["width"],
                     height=model_config["height"],
                     media_id=media_id
                 )
             
+            # Generate internal task ID (UUID format)
+            internal_task_id = f"task_{uuid.uuid4().hex[:16]}"
+            
             # Save task to database
             task = Task(
-                task_id=task_id,
+                task_id=internal_task_id,  # Internal task ID
+                sora_task_id=sora_task_id,  # Sora's original task ID
                 token_id=token_obj.id,
                 model=model,
                 prompt=prompt,
@@ -383,11 +578,18 @@ class GenerationHandler:
             )
             await self.db.create_task(task)
             
+            # Send task_id in the first chunk after task creation
+            if stream:
+                yield self._format_stream_chunk(
+                    reasoning_content=f"**Task Created**\n\nTask ID: `{internal_task_id}`\n\nGeneration request submitted successfully. Polling for results...\n",
+                    task_id=internal_task_id
+                )
+            
             # Record usage
             await self.token_manager.record_usage(token_obj.id, is_video=is_video)
             
-            # Poll for results with timeout
-            async for chunk in self._poll_task_result(task_id, token_obj.token, is_video, stream, prompt, token_obj.id):
+            # Poll for results with timeout (use sora_task_id for polling, internal_task_id for updates)
+            async for chunk in self._poll_task_result(sora_task_id, token_obj.token, is_video, stream, prompt, token_obj.id, internal_task_id):
                 yield chunk
             
             # Record success
@@ -443,9 +645,20 @@ class GenerationHandler:
             )
             raise e
     
-    async def _poll_task_result(self, task_id: str, token: str, is_video: bool,
-                                stream: bool, prompt: str, token_id: int = None) -> AsyncGenerator[str, None]:
-        """Poll for task result with timeout"""
+    async def _poll_task_result(self, sora_task_id: str, token: str, is_video: bool,
+                                stream: bool, prompt: str, token_id: int = None, 
+                                internal_task_id: Optional[str] = None) -> AsyncGenerator[str, None]:
+        """Poll for task result with timeout
+        
+        Args:
+            sora_task_id: Sora's original task ID for API polling
+            token: Access token
+            is_video: Whether this is a video task
+            stream: Whether to stream response
+            prompt: Generation prompt
+            token_id: Token ID
+            internal_task_id: Internal task ID for database updates (if None, uses sora_task_id)
+        """
         # Get timeout from config
         timeout = config.video_timeout if is_video else config.image_timeout
         poll_interval = config.poll_interval
@@ -457,7 +670,9 @@ class GenerationHandler:
         last_status_output_time = start_time  # Track last status output time for video generation
         video_status_interval = 30  # Output status every 30 seconds for video generation
 
-        debug_logger.log_info(f"Starting task polling: task_id={task_id}, is_video={is_video}, timeout={timeout}s, max_attempts={max_attempts}")
+        # Use internal_task_id for database updates, sora_task_id for API polling
+        db_task_id = internal_task_id if internal_task_id else sora_task_id
+        debug_logger.log_info(f"Starting task polling: sora_task_id={sora_task_id}, internal_task_id={internal_task_id}, is_video={is_video}, timeout={timeout}s, max_attempts={max_attempts}")
 
         # Check and log watermark-free mode status at the beginning
         if is_video:
@@ -487,7 +702,7 @@ class GenerationHandler:
                     await self.concurrency_manager.release_video(token_id)
                     debug_logger.log_info(f"Released concurrency slot for token {token_id} due to timeout")
 
-                await self.db.update_task(task_id, "failed", 0, error_message=f"Generation timeout after {elapsed_time:.1f} seconds")
+                await self.db.update_task(db_task_id, "failed", 0, error_message=f"Generation timeout after {elapsed_time:.1f} seconds")
                 raise Exception(f"Upstream API timeout: Generation exceeded {timeout} seconds limit")
 
 
@@ -498,10 +713,10 @@ class GenerationHandler:
                     # Get pending tasks to check progress
                     pending_tasks = await self.sora_client.get_pending_tasks(token)
 
-                    # Find matching task in pending tasks
+                    # Find matching task in pending tasks (use Sora's task ID)
                     task_found = False
                     for task in pending_tasks:
-                        if task.get("id") == task_id:
+                        if task.get("id") == sora_task_id:
                             task_found = True
                             # Update progress
                             progress_pct = task.get("progress_pct")
@@ -511,15 +726,18 @@ class GenerationHandler:
                             else:
                                 progress_pct = int(progress_pct * 100)
 
-                            # Update last_progress for tracking
-                            last_progress = progress_pct
                             status = task.get("status", "processing")
+                            
+                            # Update database if progress changed significantly (every 20% or first non-zero progress)
+                            if progress_pct > last_progress + 20 or (last_progress == 0 and progress_pct > 0):
+                                last_progress = progress_pct
+                                await self.db.update_task(db_task_id, status, float(progress_pct))
 
                             # Output status every 30 seconds (not just when progress changes)
                             current_time = time.time()
                             if stream and (current_time - last_status_output_time >= video_status_interval):
                                 last_status_output_time = current_time
-                                debug_logger.log_info(f"Task {task_id} progress: {progress_pct}% (status: {status})")
+                                debug_logger.log_info(f"Task {sora_task_id} progress: {progress_pct}% (status: {status})")
                                 yield self._format_stream_chunk(
                                     reasoning_content=f"**Video Generation Progress**: {progress_pct}% ({status})\n"
                                 )
@@ -527,18 +745,18 @@ class GenerationHandler:
 
                     # If task not found in pending tasks, it's completed - fetch from drafts
                     if not task_found:
-                        debug_logger.log_info(f"Task {task_id} not found in pending tasks, fetching from drafts...")
+                        debug_logger.log_info(f"Task {sora_task_id} not found in pending tasks, fetching from drafts...")
                         result = await self.sora_client.get_video_drafts(token)
                         items = result.get("items", [])
 
-                        # Find matching task in drafts
+                        # Find matching task in drafts (use Sora's task ID)
                         for item in items:
-                            if item.get("task_id") == task_id:
+                            if item.get("task_id") == sora_task_id:
                                 # Check for content violation
                                 kind = item.get("kind")
                                 reason_str = item.get("reason_str") or item.get("markdown_reason_str")
                                 url = item.get("url") or item.get("downloadable_url")
-                                debug_logger.log_info(f"Found task {task_id} in drafts with kind: {kind}, reason_str: {reason_str}, has_url: {bool(url)}")
+                                debug_logger.log_info(f"Found task {sora_task_id} in drafts with kind: {kind}, reason_str: {reason_str}, has_url: {bool(url)}")
 
                                 # Check if content violates policy
                                 # Violation indicators: kind is violation type, or has reason_str, or missing video URL
@@ -585,7 +803,7 @@ class GenerationHandler:
 
                                 if watermark_free_enabled:
                                     # Watermark-free mode: post video and get watermark-free URL
-                                    debug_logger.log_info(f"Entering watermark-free mode for task {task_id}")
+                                    debug_logger.log_info(f"Entering watermark-free mode for task {sora_task_id} (internal: {db_task_id})")
                                     generation_id = item.get("id")
                                     debug_logger.log_info(f"Generation ID: {generation_id}")
                                     if not generation_id:
@@ -742,9 +960,9 @@ class GenerationHandler:
                                                     reasoning_content="**Video Generation Completed**\n\nCache is disabled. Using original URL directly...\n"
                                                 )
 
-                                # Task completed
+                                # Task completed (use internal task ID for database update)
                                 await self.db.update_task(
-                                    task_id, "completed", 100.0,
+                                    db_task_id, "completed", 100.0,
                                     result_urls=json.dumps([local_url])
                                 )
 
@@ -760,10 +978,10 @@ class GenerationHandler:
                     result = await self.sora_client.get_image_tasks(token)
                     task_responses = result.get("task_responses", [])
 
-                    # Find matching task
+                    # Find matching task (use Sora's task ID)
                     task_found = False
                     for task_resp in task_responses:
-                        if task_resp.get("id") == task_id:
+                        if task_resp.get("id") == sora_task_id:
                             task_found = True
                             status = task_resp.get("status")
                             progress = task_resp.get("progress_pct", 0) * 100
@@ -815,7 +1033,7 @@ class GenerationHandler:
                                             )
 
                                     await self.db.update_task(
-                                        task_id, "completed", 100.0,
+                                        db_task_id, "completed", 100.0,
                                         result_urls=json.dumps(local_urls)
                                     )
 
@@ -831,14 +1049,14 @@ class GenerationHandler:
 
                             elif status == "failed":
                                 error_msg = task_resp.get("error_message", "Generation failed")
-                                await self.db.update_task(task_id, "failed", progress, error_message=error_msg)
+                                await self.db.update_task(db_task_id, "failed", progress, error_message=error_msg)
                                 raise Exception(error_msg)
 
                             elif status == "processing":
                                 # Update progress only if changed significantly
                                 if progress > last_progress + 20:  # Update every 20%
                                     last_progress = progress
-                                    await self.db.update_task(task_id, "processing", progress)
+                                    await self.db.update_task(db_task_id, "processing", progress)
 
                                     if stream:
                                         yield self._format_stream_chunk(
@@ -893,11 +1111,11 @@ class GenerationHandler:
             await self.concurrency_manager.release_video(token_id)
             debug_logger.log_info(f"Released concurrency slot for token {token_id} due to max attempts reached")
 
-        await self.db.update_task(task_id, "failed", 0, error_message=f"Generation timeout after {timeout} seconds")
+        await self.db.update_task(db_task_id, "failed", 0, error_message=f"Generation timeout after {timeout} seconds")
         raise Exception(f"Upstream API timeout: Generation exceeded {timeout} seconds limit")
     
     def _format_stream_chunk(self, content: str = None, reasoning_content: str = None,
-                            finish_reason: str = None, is_first: bool = False) -> str:
+                            finish_reason: str = None, is_first: bool = False, task_id: str = None) -> str:
         """Format streaming response chunk
 
         Args:
@@ -905,6 +1123,7 @@ class GenerationHandler:
             reasoning_content: Thinking/reasoning process content
             finish_reason: Finish reason (e.g., "STOP")
             is_first: Whether this is the first chunk (includes role)
+            task_id: Task ID for tracking the generation task
         """
         chunk_id = f"chatcmpl-{int(datetime.now().timestamp() * 1000)}"
 
@@ -942,6 +1161,10 @@ class GenerationHandler:
                 "prompt_tokens": 0
             }
         }
+
+        # Add task_id if provided
+        if task_id:
+            response["task_id"] = task_id
 
         # Add completion tokens for final chunk
         if finish_reason:
@@ -1225,16 +1448,20 @@ class GenerationHandler:
             # Get n_frames from model configuration
             n_frames = model_config.get("n_frames", 300)  # Default to 300 frames (10s)
 
-            task_id = await self.sora_client.generate_video(
+            sora_task_id = await self.sora_client.generate_video(
                 full_prompt, token_obj.token,
                 orientation=model_config["orientation"],
                 n_frames=n_frames
             )
-            debug_logger.log_info(f"Video generation started, task_id: {task_id}")
+            debug_logger.log_info(f"Video generation started, sora_task_id: {sora_task_id}")
+
+            # Generate internal task ID
+            internal_task_id = f"task_{uuid.uuid4().hex[:16]}"
 
             # Save task to database
             task = Task(
-                task_id=task_id,
+                task_id=internal_task_id,  # Internal task ID
+                sora_task_id=sora_task_id,  # Sora's original task ID
                 token_id=token_obj.id,
                 model=f"sora-video-{model_config['orientation']}",
                 prompt=full_prompt,
@@ -1243,11 +1470,17 @@ class GenerationHandler:
             )
             await self.db.create_task(task)
 
+            # Send task_id in chunk
+            yield self._format_stream_chunk(
+                reasoning_content=f"**Task Created**\n\nTask ID: `{internal_task_id}`\n\nVideo generation with character submitted successfully. Polling for results...\n",
+                task_id=internal_task_id
+            )
+
             # Record usage
             await self.token_manager.record_usage(token_obj.id, is_video=True)
 
-            # Poll for results
-            async for chunk in self._poll_task_result(task_id, token_obj.token, True, True, full_prompt, token_obj.id):
+            # Poll for results (use sora_task_id for polling, internal_task_id for updates)
+            async for chunk in self._poll_task_result(sora_task_id, token_obj.token, True, True, full_prompt, token_obj.id, internal_task_id):
                 yield chunk
 
             # Record success
@@ -1310,18 +1543,22 @@ class GenerationHandler:
             yield self._format_stream_chunk(
                 reasoning_content="Sending remix request to server...\n"
             )
-            task_id = await self.sora_client.remix_video(
+            sora_task_id = await self.sora_client.remix_video(
                 remix_target_id=remix_target_id,
                 prompt=clean_prompt,
                 token=token_obj.token,
                 orientation=model_config["orientation"],
                 n_frames=n_frames
             )
-            debug_logger.log_info(f"Remix generation started, task_id: {task_id}")
+            debug_logger.log_info(f"Remix generation started, sora_task_id: {sora_task_id}")
+
+            # Generate internal task ID
+            internal_task_id = f"task_{uuid.uuid4().hex[:16]}"
 
             # Save task to database
             task = Task(
-                task_id=task_id,
+                task_id=internal_task_id,  # Internal task ID
+                sora_task_id=sora_task_id,  # Sora's original task ID
                 token_id=token_obj.id,
                 model=f"sora-video-{model_config['orientation']}",
                 prompt=f"remix:{remix_target_id} {clean_prompt}",
@@ -1330,11 +1567,17 @@ class GenerationHandler:
             )
             await self.db.create_task(task)
 
+            # Send task_id in chunk
+            yield self._format_stream_chunk(
+                reasoning_content=f"**Task Created**\n\nTask ID: `{internal_task_id}`\n\nRemix request submitted successfully. Polling for results...\n",
+                task_id=internal_task_id
+            )
+
             # Record usage
             await self.token_manager.record_usage(token_obj.id, is_video=True)
 
-            # Poll for results
-            async for chunk in self._poll_task_result(task_id, token_obj.token, True, True, clean_prompt, token_obj.id):
+            # Poll for results (use sora_task_id for polling, internal_task_id for updates)
+            async for chunk in self._poll_task_result(sora_task_id, token_obj.token, True, True, clean_prompt, token_obj.id, internal_task_id):
                 yield chunk
 
             # Record success

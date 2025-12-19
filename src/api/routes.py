@@ -2,22 +2,30 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 import json
 import re
+from pydantic import BaseModel
 from ..core.auth import verify_api_key_header
 from ..core.models import ChatCompletionRequest
+from ..core.database import Database
 from ..services.generation_handler import GenerationHandler, MODEL_CONFIG
 
 router = APIRouter()
 
 # Dependency injection will be set up in main.py
 generation_handler: GenerationHandler = None
+db: Database = None
 
 def set_generation_handler(handler: GenerationHandler):
     """Set generation handler instance"""
     global generation_handler
     generation_handler = handler
+
+def set_database(database: Database):
+    """Set database instance"""
+    global db
+    db = database
 
 def _extract_remix_id(text: str) -> str:
     """Extract remix ID from text
@@ -238,6 +246,121 @@ async def create_chat_completion(
         raise
     except Exception as e:
         # Return OpenAI-compatible error format
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "server_error",
+                    "param": None,
+                    "code": None
+                }
+            }
+        )
+
+# Task management endpoints
+class CreateTaskRequest(BaseModel):
+    """Request model for creating a task"""
+    model: str
+    prompt: str
+    image: Optional[str] = None  # Base64 encoded image
+    video: Optional[str] = None  # Base64 encoded video or video URL
+    remix_target_id: Optional[str] = None  # Sora share link video ID for remix
+
+@router.post("/v1/tasks")
+async def create_task(
+    request: CreateTaskRequest,
+    api_key: str = Depends(verify_api_key_header)
+):
+    """Create a generation task asynchronously
+    
+    This endpoint creates a task and returns immediately with the task ID.
+    The task will be processed in the background. Use GET /v1/tasks/{task_id} to query the status.
+    """
+    if not generation_handler:
+        raise HTTPException(status_code=500, detail="Generation handler not initialized")
+    
+    try:
+        # Validate model
+        if request.model not in MODEL_CONFIG:
+            raise HTTPException(status_code=400, detail=f"Invalid model: {request.model}")
+        
+        # Create task asynchronously
+        result = await generation_handler.create_task_async(
+            model=request.model,
+            prompt=request.prompt,
+            image=request.image,
+            video=request.video,
+            remix_target_id=request.remix_target_id
+        )
+        
+        return JSONResponse(content=result)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "server_error",
+                    "param": None,
+                    "code": None
+                }
+            }
+        )
+
+@router.get("/v1/tasks/{task_id}")
+async def get_task(
+    task_id: str,
+    api_key: str = Depends(verify_api_key_header)
+):
+    """Get task status by task ID
+    
+    Returns the current status, progress, and result URLs (if completed) of a task.
+    """
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    
+    try:
+        # Query by internal task ID (not Sora's task ID)
+        task = await db.get_task(task_id)
+        
+        if not task:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        
+        # Token ownership verification
+        # Note: Currently all tasks use the same API key, so we only verify API key
+        # In the future, if multi-user support is added, we can verify:
+        # - task.token_id matches the user's token
+        # - or task was created with the same API key
+        
+        # Parse result_urls if available
+        result_urls = None
+        if task.result_urls:
+            try:
+                result_urls = json.loads(task.result_urls)
+            except:
+                result_urls = []
+        
+        response = {
+            "task_id": task.task_id,  # Return internal task ID (not Sora's ID)
+            "status": task.status,  # processing, completed, failed
+            "progress": task.progress,  # 0.0 to 100.0
+            "model": task.model,
+            "prompt": task.prompt,
+            "result_urls": result_urls,  # List of URLs if completed
+            "error_message": task.error_message,  # Error message if failed
+            "created_at": task.created_at.isoformat() if task.created_at else None,
+            "completed_at": task.completed_at.isoformat() if task.completed_at else None
+        }
+        
+        return JSONResponse(content=response)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
         return JSONResponse(
             status_code=500,
             content={

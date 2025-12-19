@@ -1151,3 +1151,163 @@ class TokenManager:
         except Exception as e:
             debug_logger.log_info(f"[AUTO_REFRESH] 🔴 Token {token_id}: 自动刷新异常 - {str(e)}")
             return False
+
+    async def manual_refresh_token(self, token_id: int) -> dict:
+        """
+        Manually refresh token using ST or RT (no expiry time check)
+
+        Args:
+            token_id: Token ID to refresh
+
+        Returns:
+            {
+                "success": bool,
+                "message": str,
+                "refresh_method": Optional[str],  # "ST" or "RT" or None
+                "old_expiry_time": Optional[str],  # ISO format
+                "new_expiry_time": Optional[str],  # ISO format
+                "error": Optional[str]  # Error message if failed
+            }
+        """
+        try:
+            # 📍 Step 1: 获取Token数据
+            debug_logger.log_info(f"[MANUAL_REFRESH] 开始手动刷新Token {token_id}...")
+            token_data = await self.db.get_token(token_id)
+
+            if not token_data:
+                error_msg = f"Token {token_id} 不存在"
+                debug_logger.log_info(f"[MANUAL_REFRESH] ❌ {error_msg}")
+                return {
+                    "success": False,
+                    "message": error_msg,
+                    "refresh_method": None,
+                    "old_expiry_time": None,
+                    "new_expiry_time": None,
+                    "error": error_msg
+                }
+
+            # 📍 Step 2: 记录当前过期时间
+            old_expiry_time = token_data.expiry_time.isoformat() if token_data.expiry_time else None
+            hours_until_expiry = None
+            if token_data.expiry_time:
+                time_until_expiry = token_data.expiry_time - datetime.now()
+                hours_until_expiry = time_until_expiry.total_seconds() / 3600
+
+            debug_logger.log_info(f"[MANUAL_REFRESH] ⏰ Token {token_id} 信息:")
+            debug_logger.log_info(f"  - Email: {token_data.email}")
+            debug_logger.log_info(f"  - 过期时间: {token_data.expiry_time.strftime('%Y-%m-%d %H:%M:%S') if token_data.expiry_time else 'N/A'}")
+            if hours_until_expiry is not None:
+                debug_logger.log_info(f"  - 剩余时间: {hours_until_expiry:.2f} 小时")
+            debug_logger.log_info(f"  - 是否激活: {token_data.is_active}")
+            debug_logger.log_info(f"  - 有ST: {'是' if token_data.st else '否'}")
+            debug_logger.log_info(f"  - 有RT: {'是' if token_data.rt else '否'}")
+
+            # 📍 Step 3: 检查是否有ST或RT
+            if not token_data.st and not token_data.rt:
+                error_msg = "Token 没有 ST 或 RT，无法刷新"
+                debug_logger.log_info(f"[MANUAL_REFRESH] ❌ {error_msg}")
+                return {
+                    "success": False,
+                    "message": error_msg,
+                    "refresh_method": None,
+                    "old_expiry_time": old_expiry_time,
+                    "new_expiry_time": None,
+                    "error": error_msg
+                }
+
+            # 📍 Step 4: 触发刷新 (Priority: ST > RT)
+            new_at = None
+            new_st = None
+            new_rt = None
+            refresh_method = None
+            error_msg = None
+
+            # 尝试使用ST刷新
+            if token_data.st:
+                try:
+                    debug_logger.log_info(f"[MANUAL_REFRESH] 📝 Token {token_id}: 尝试使用 ST 刷新...")
+                    result = await self.st_to_at(token_data.st)
+                    new_at = result.get("access_token")
+                    new_st = token_data.st  # ST refresh doesn't return new ST, so keep the old one
+                    refresh_method = "ST"
+                    debug_logger.log_info(f"[MANUAL_REFRESH] ✅ Token {token_id}: 使用 ST 刷新成功")
+                except Exception as e:
+                    error_msg = f"ST刷新失败: {str(e)}"
+                    debug_logger.log_info(f"[MANUAL_REFRESH] ❌ Token {token_id}: {error_msg}")
+                    new_at = None
+
+            # 如果ST失败，尝试使用RT
+            if not new_at and token_data.rt:
+                try:
+                    debug_logger.log_info(f"[MANUAL_REFRESH] 📝 Token {token_id}: 尝试使用 RT 刷新...")
+                    result = await self.rt_to_at(token_data.rt, client_id=token_data.client_id)
+                    new_at = result.get("access_token")
+                    new_rt = result.get("refresh_token", token_data.rt)  # RT might be updated
+                    refresh_method = "RT"
+                    error_msg = None  # Clear previous error
+                    debug_logger.log_info(f"[MANUAL_REFRESH] ✅ Token {token_id}: 使用 RT 刷新成功")
+                except Exception as e:
+                    error_msg = f"RT刷新失败: {str(e)}"
+                    debug_logger.log_info(f"[MANUAL_REFRESH] ❌ Token {token_id}: {error_msg}")
+                    new_at = None
+
+            # 📍 Step 5: 处理刷新结果
+            if new_at:
+                # 刷新成功: 更新Token
+                debug_logger.log_info(f"[MANUAL_REFRESH] 💾 Token {token_id}: 保存新的 Access Token...")
+                await self.update_token(token_id, token=new_at, st=new_st, rt=new_rt)
+
+                # 获取更新后的Token信息
+                updated_token = await self.db.get_token(token_id)
+                new_expiry_time = updated_token.expiry_time.isoformat() if updated_token.expiry_time else None
+                new_hours_until_expiry = None
+                if updated_token.expiry_time:
+                    time_until_expiry = updated_token.expiry_time - datetime.now()
+                    new_hours_until_expiry = time_until_expiry.total_seconds() / 3600
+
+                debug_logger.log_info(f"[MANUAL_REFRESH] ✅ Token {token_id} 已手动刷新成功")
+                debug_logger.log_info(f"  - 刷新方式: {refresh_method}")
+                debug_logger.log_info(f"  - 新过期时间: {updated_token.expiry_time.strftime('%Y-%m-%d %H:%M:%S') if updated_token.expiry_time else 'N/A'}")
+                if new_hours_until_expiry is not None:
+                    debug_logger.log_info(f"  - 新剩余时间: {new_hours_until_expiry:.2f} 小时")
+
+                # 检查刷新后的过期时间，但不自动禁用（让用户决定）
+                status_msg = "Token 刷新成功"
+                if new_hours_until_expiry is not None:
+                    if new_hours_until_expiry < 0:
+                        status_msg += "（但新Token已过期）"
+                    elif new_hours_until_expiry < 24:
+                        status_msg += f"（剩余时间: {new_hours_until_expiry:.2f} 小时）"
+
+                return {
+                    "success": True,
+                    "message": status_msg,
+                    "refresh_method": refresh_method,
+                    "old_expiry_time": old_expiry_time,
+                    "new_expiry_time": new_expiry_time,
+                    "error": None
+                }
+            else:
+                # 刷新失败
+                final_error_msg = error_msg or "无法刷新（ST 和 RT 都无效）"
+                debug_logger.log_info(f"[MANUAL_REFRESH] 🚫 Token {token_id}: {final_error_msg}")
+                return {
+                    "success": False,
+                    "message": final_error_msg,
+                    "refresh_method": None,
+                    "old_expiry_time": old_expiry_time,
+                    "new_expiry_time": None,
+                    "error": final_error_msg
+                }
+
+        except Exception as e:
+            error_msg = f"手动刷新异常: {str(e)}"
+            debug_logger.log_info(f"[MANUAL_REFRESH] 🔴 Token {token_id}: {error_msg}")
+            return {
+                "success": False,
+                "message": error_msg,
+                "refresh_method": None,
+                "old_expiry_time": None,
+                "new_expiry_time": None,
+                "error": error_msg
+            }

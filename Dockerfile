@@ -16,10 +16,14 @@ COPY . .
 # Create necessary directories
 RUN mkdir -p data tmp static
 
-EXPOSE 8000
+# Declare volume for data persistence
+# This ensures data persists even if container is removed
+VOLUME ["/app/data"]
+
+EXPOSE 8090
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import socket; s=socket.socket(); s.connect(('localhost', 8000)); s.close()" || exit 1
+    CMD python -c "import socket; s=socket.socket(); s.connect(('localhost', 8090)); s.close()" || exit 1
 
 CMD ["python", "main.py"]

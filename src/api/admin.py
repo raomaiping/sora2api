@@ -328,6 +328,15 @@ async def test_token(token_id: int, token: str = Depends(verify_admin_token)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@router.post("/api/tokens/{token_id}/refresh")
+async def refresh_token(token_id: int, token: str = Depends(verify_admin_token)):
+    """Manually refresh a token using ST or RT"""
+    try:
+        result = await token_manager.manual_refresh_token(token_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @router.delete("/api/tokens/{token_id}")
 async def delete_token(token_id: int, token: str = Depends(verify_admin_token)):
     """Delete a token"""

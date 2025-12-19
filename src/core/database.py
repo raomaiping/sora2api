@@ -253,6 +253,19 @@ class Database:
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
 
+            # Check and add missing columns to tasks table
+            if await self._table_exists(db, "tasks"):
+                columns_to_add = [
+                    ("sora_task_id", "TEXT")
+                ]
+                for col_name, col_type in columns_to_add:
+                    if not await self._column_exists(db, "tasks", col_name):
+                        try:
+                            await db.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
+                            print(f"  ✓ Added column '{col_name}' to tasks table")
+                        except Exception as e:
+                            print(f"  ✗ Failed to add column '{col_name}': {e}")
+
             # Ensure all config tables have their default rows
             # Pass config_dict if available to initialize from setting.toml
             await self._ensure_config_rows(db, config_dict)
@@ -787,9 +800,9 @@ class Database:
         """Create a new task"""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("""
-                INSERT INTO tasks (task_id, token_id, model, prompt, status, progress)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (task.task_id, task.token_id, task.model, task.prompt, task.status, task.progress))
+                INSERT INTO tasks (task_id, sora_task_id, token_id, model, prompt, status, progress)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (task.task_id, task.sora_task_id, task.token_id, task.model, task.prompt, task.status, task.progress))
             await db.commit()
             return cursor.lastrowid
     
@@ -806,10 +819,20 @@ class Database:
             await db.commit()
     
     async def get_task(self, task_id: str) -> Optional[Task]:
-        """Get task by ID"""
+        """Get task by internal task ID"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+            row = await cursor.fetchone()
+            if row:
+                return Task(**dict(row))
+            return None
+    
+    async def get_task_by_sora_id(self, sora_task_id: str) -> Optional[Task]:
+        """Get task by Sora's original task ID"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM tasks WHERE sora_task_id = ?", (sora_task_id,))
             row = await cursor.fetchone()
             if row:
                 return Task(**dict(row))

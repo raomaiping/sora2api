@@ -55,7 +55,8 @@ class TokenStats(BaseModel):
 class Task(BaseModel):
     """Task model"""
     id: Optional[int] = None
-    task_id: str
+    task_id: str  # Internal task ID (UUID format)
+    sora_task_id: Optional[str] = None  # Sora's original task ID
     token_id: int
     model: str
     prompt: str
